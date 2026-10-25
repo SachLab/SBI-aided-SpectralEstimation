@@ -14,7 +14,8 @@ report_code/
 ├── config.py   — Contain model and experiment configurations.            
 ├── synthesis_dataset.py  — Generate synthetic datasets.  
 ├── dataset.py  — Load single-window dataset and prepcoessing            
-├── crosswin_data.py  — Prepare cross-window dataset.      
+├── crosswin_data.py  — Prepare cross-window dataset.
+├── ckpt_root.py — directory path utility.
 ├── encoder.py  — Implement the frequency axis attention on single-window data.          
 ├── axial_vit.py — Implement the time axis attention on cross-window data.           
 ├── window_fusion.py — Implement the mean poolng of all windows for unified output.       
