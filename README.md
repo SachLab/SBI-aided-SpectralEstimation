@@ -9,7 +9,7 @@ Python 3 + PyTorch + NumPy + TensorBoard
 
 ##  Code Structure
 
-...
+```text
 report_code/
 ├── config.py   — Contain model and experiment configurations.            
 ├── synthesis_dataset.py  — Generate synthetic datasets.  
@@ -27,7 +27,7 @@ report_code/
 ├── train_time_axis.py   — Training script for the time-axis (phase 3).   
 ├── calib_time_axis.py   — Training script for the sigma head of the time axis (phase 4).  
 ├── infer.py  — Inference script for the two-stage method.               
-...
+```
 
 ## Brief outline of training in Stage 1
 1.The first step in Stage 1 is supervised dataset generation. We generate the data on the fly and the generation is in the training scripts. In Phase 1 and 2, the single-window data generation relies on 'UnifiedBTTDataset' from dataset.py. In Phase 3 and 4, the cross-window data generation relies on 'CrossWinDataset' from crosswin_data.py. The data configuration is in config.py.
@@ -38,19 +38,26 @@ The second step is to train the neural network. In total, there are four trainin
 
 The running of the training is implemente in order: 
 
-# Phase 1
+### Phase 1
+```python
 python train_freq_axis.py --stage stage1
+```
 
-# Phase 2
+### Phase 2
+```python
 python train_freq_axis.py --stage stage2 --stage1_ckpt artifacts/ftf_stage1/best.pt
+```
 
-# Phase 3
+### Phase 3
+```python
 python train_time_axis.py artifacts/ftf_stage2/best.pt artifacts/ftf_stage2/config.json
+```
 
-# Phase 4
+### Phase 4
+```python
 python calib_time_axis.py artifacts/axial_vit_frozenfreq/best.pt \
                           artifacts/axial_vit_frozenfreq/config.json
-
+```
 The output directories will be create automatically by running the scripts.
 
 ## Two-stage Inference
