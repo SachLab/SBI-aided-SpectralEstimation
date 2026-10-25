@@ -1,119 +1,153 @@
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 
-from config import grid_size, signal_dim as _signal_dim
-from dataset import film_input, film_input_dim, rate_ref_hz
+from encoder import NUDFTFreqTransformerAnchor
+
+TWO_PI = 2.0 * math.pi
 
 
-class FiLM(nn.Module):
-    def __init__(self, summary_dim, n_channels, hidden=64):
+class _TimeAxisRoPEAttn(nn.Module):
+    def __init__(self, d, nhead, fmin=0.1, fmax=10.0):
         super().__init__()
-        self.C = n_channels
-        self.mlp = nn.Sequential(
-            nn.Linear(summary_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, 2 * n_channels))
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        self.d, self.h, self.dh = d, nhead, d // nhead
+        self.qkv = nn.Linear(d, 3 * d)
+        self.o = nn.Linear(d, d)
+        nn.init.zeros_(self.o.weight)          
+        nn.init.zeros_(self.o.bias)
+        nf = self.dh // 2
+        freqs = torch.logspace(math.log10(fmin), math.log10(fmax), nf)
+        self.register_buffer("rot_w", TWO_PI * freqs)
 
-    def forward(self, x, summary):                 # x:[B,C,L], summary:[B,S]
-        gb = self.mlp(summary)                      # [B,2C]
-        gamma, beta = gb[:, :self.C], gb[:, self.C:]
-        return (1.0 + gamma[..., None]) * x + beta[..., None]
+    def _rope(self, x, tau):
+        # x[Bg,h,M,dh], tau[Bg,M] 
+        Bg, h, M, dh = x.shape
+        nf = dh // 2
+        ang = self.rot_w.view(1, 1, 1, nf) * tau.view(Bg, 1, M, 1)
+        cos, sin = torch.cos(ang), torch.sin(ang)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).flatten(-2)
+
+    def forward(self, x, tau):
+        # x[Bg,M,d], tau[Bg,M] → attention over M (
+        Bg, M, _ = x.shape
+        q, k, v = self.qkv(x).chunk(3, -1)
+        q = q.view(Bg, M, self.h, self.dh).transpose(1, 2)
+        k = k.view(Bg, M, self.h, self.dh).transpose(1, 2)
+        v = v.view(Bg, M, self.h, self.dh).transpose(1, 2)
+        q, k = self._rope(q, tau), self._rope(k, tau)
+        a = (q @ k.transpose(-2, -1)) / math.sqrt(self.dh)
+        o = (a.softmax(-1) @ v).transpose(1, 2).reshape(Bg, M, self.d)
+        return self.o(o)
 
 
-class _FreqSelfAttnLayer(nn.Module):
-    def __init__(self, d_model, n_heads, ffn_dim):
+class _TimeAxisLayer(nn.Module):
+    def __init__(self, d, nhead, ff):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(nn.Linear(d_model, ffn_dim), nn.GELU(),
-                                 nn.Linear(ffn_dim, d_model))
+        self.n1 = nn.LayerNorm(d)
+        self.attn = _TimeAxisRoPEAttn(d, nhead)
+        self.n2 = nn.LayerNorm(d)
+        self.ff = nn.Sequential(nn.Linear(d, ff), nn.GELU(), nn.Linear(ff, d))
+        nn.init.zeros_(self.ff[-1].weight)    
+        nn.init.zeros_(self.ff[-1].bias)
 
-    def forward(self, x):
-        h = self.norm1(x)
-        x = x + self.attn(h, h, h, need_weights=False)[0]
-        x = x + self.ffn(self.norm2(x))
-        return x
+    def forward(self, x, tau):
+        B, M, G, d = x.shape
+        xr = x.permute(0, 2, 1, 3).reshape(B * G, M, d)     
+        taur = tau[:, None, :].expand(B, G, M).reshape(B * G, M)   
+        xr = xr + self.attn(self.n1(xr), taur)
+        xr = xr + self.ff(self.n2(xr))
+        return xr.reshape(B, G, M, d).permute(0, 2, 1, 3)  
 
 
-class NUDFTFreqTransformerAnchor(nn.Module):
-    def __init__(self, signal_dim, grid_size, f_lo=0.0, f_hi=500.0,
-                 d_model=128, n_heads=8, n_layers=4, ffn_dim=256,
-                 dropout=0.0, use_film=True, summary_dim=4):
+class AxialViT(nn.Module):
+    def __init__(self, ftf: NUDFTFreqTransformerAnchor, cfg, n_time_layers=None):
         super().__init__()
-        self.grid_size = grid_size
-        self.signal_dim = signal_dim
-        self.register_buffer("freqs", torch.linspace(f_lo, f_hi, grid_size))
-        self.in_proj = nn.Linear(2, d_model)                 # [Re,Im] -> d
-        self.freq_embed = nn.Parameter(torch.randn(grid_size, d_model) * 0.02)
-        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.use_film = bool(use_film)
-        self.film = FiLM(summary_dim, d_model) if self.use_film else None
-        self.layers = nn.ModuleList([_FreqSelfAttnLayer(d_model, n_heads, ffn_dim)
-                                     for _ in range(n_layers)])
-        self.final_norm = nn.LayerNorm(d_model)
-        self.obj_head = nn.Linear(d_model, 1)
-        self.delta_head = nn.Linear(d_model, 1)
-        self.sigma_head = nn.Linear(d_model, 1)
+        self.cfg = cfg
+        self.G = int(ftf.grid_size)
+        self.signal_dim = int(ftf.signal_dim)
+        self.register_buffer("freqs", ftf.freqs.clone())
+        self.in_proj = ftf.in_proj
+        self.freq_embed = ftf.freq_embed
+        self.drop = ftf.drop
+        self.use_film = ftf.use_film
+        self.film = ftf.film
+        self.freq_layers = ftf.layers                    # ModuleList[_FreqSelfAttnLayer] × L
+        self.final_norm = ftf.final_norm
+        self.obj_head, self.delta_head, self.sigma_head = ftf.obj_head, ftf.delta_head, ftf.sigma_head
+        L = len(self.freq_layers)
+        n_time = L if n_time_layers is None else int(n_time_layers)
+        acfg = cfg["crosswin"]["time_axis"]
+        d = self.freq_embed.shape[1]
+        self.time_layers = nn.ModuleList([
+            _TimeAxisLayer(d, int(acfg["n_heads"]), int(acfg["ffn_dim"]))
+            for _ in range(n_time)])
+        self.n_pair = min(L, n_time)
 
-    def forward(self, signal, t_n=None, rate_summary=None):
-        b = signal.size(0)
-        yr, yi = signal[:, 0], signal[:, 1]                  # [B,N]
-        if t_n is None:
-            t_n = torch.arange(self.signal_dim, device=signal.device,
-                               dtype=signal.dtype)[None, :].expand(b, -1)
-        phase = 2 * math.pi * self.freqs[None, :, None] * t_n[:, None, :]    # [B,G,N]
+    @staticmethod
+    def _apply_head(h, layer):
+        return layer(h).squeeze(-1)                      # h[B,M,G,d] → [B,M,G]
+
+    def _nudft(self, yr, yi, t_n):
+        # [B·M,N] → S[B·M,G,2] → token[B·M,G,d]. 
+        phase = 2 * math.pi * self.freqs[None, :, None] * t_n[:, None, :]
         cos, sin = torch.cos(phase), torch.sin(phase)
-        sr = (yr[:, None, :] * cos + yi[:, None, :] * sin).sum(-1)           # [B,G]
-        si = (yi[:, None, :] * cos - yr[:, None, :] * sin).sum(-1)           # [B,G]
-        s = torch.stack([sr, si], dim=-1) / math.sqrt(self.signal_dim)       # [B,G,2] 
-        x = self.in_proj(s) + self.freq_embed[None]                          # [B,G,d]
-        if self.use_film and rate_summary is not None:
-            x = self.film(x.transpose(1, 2), rate_summary).transpose(1, 2)   # [B,G,d]
+        sr = (yr[:, None, :] * cos + yi[:, None, :] * sin).sum(-1)
+        si = (yi[:, None, :] * cos - yr[:, None, :] * sin).sum(-1)
+        s = torch.stack([sr, si], dim=-1) / math.sqrt(self.signal_dim)
+        return self.in_proj(s) + self.freq_embed[None]
+
+    def _freq_tokens(self, batch, device):
+        from dataset import film_input           
+        from encoder import _FILM_KEY
+        B, M = batch["signal"].shape[:2]
+        sig = batch["signal"].to(device).reshape(B * M, 2, -1)
+        t_n = batch["t_n"].to(device).reshape(B * M, -1)
+        yr, yi = sig[:, 0], sig[:, 1]
+        x = self._nudft(yr, yi, t_n)                     # [B·M,G,d]
+        if self.use_film and self.cfg["encoder"]["rate_inject"]:
+            rk = _FILM_KEY[film_input(self.cfg)]
+            rate = batch[rk].to(device)
+            rate = rate.reshape(B * M, *rate.shape[2:])
+            x = self.film(x.transpose(1, 2), rate).transpose(1, 2)
         x = self.drop(x)
-        for layer in self.layers:
-            x = layer(x)                                     # self-attention
-        x = self.final_norm(x)                               # [B,G,d]
-        obj_logit = self.obj_head(x).squeeze(-1)             # [B,G]
-        delta = 0.5 * torch.tanh(self.delta_head(x).squeeze(-1))
-        log_sigma = self.sigma_head(x).squeeze(-1)
-        return {"obj_logit": obj_logit, "delta": delta, "log_sigma": log_sigma}
+        return x.reshape(B, M, self.G, -1)
+
+    def _heads(self, x_freq):
+        obj = self._apply_head(x_freq, self.obj_head)
+        delta = 0.5 * torch.tanh(self._apply_head(x_freq, self.delta_head))
+        log_sigma = self._apply_head(x_freq, self.sigma_head)    
+        return obj, delta, log_sigma
+
+    def forward(self, batch, device):
+        B, M = batch["signal"].shape[:2]
+        tau = batch["tau"].to(device)                    
+        x = self._freq_tokens(batch, device)             # [B,M,G,d]
+
+        x0 = x
+        for fl in self.freq_layers:
+            xf = x0.reshape(B * M, self.G, -1)
+            x0 = fl(xf).reshape(B, M, self.G, -1)
+        x0 = self.final_norm(x0)
+        obj0, delta0, log_sig0 = self._heads(x0)
+
+        for i in range(len(self.freq_layers)):
+            xf = x.reshape(B * M, self.G, -1)
+            x = self.freq_layers[i](xf).reshape(B, M, self.G, -1)   
+            if i < self.n_pair:
+                x = self.time_layers[i](x, tau)                     
+        x = self.final_norm(x)
+        obj_t, delta_t, log_sig_t = self._heads(x)
+        return {"obj_logit": obj_t, "delta": delta_t, "log_sigma": log_sig_t,
+                "obj0": obj0, "delta0": delta0, "log_sig0": log_sig0,
+                "feat": x}
 
 
-def build_encoder(cfg):
-    fcfg = cfg["frequency"]
-    acfg = cfg["encoder"]["anchor"]
-    t = cfg["encoder"]["ftf"]
-    frr = cfg["data"]["f_rot_range"]
-    if frr is not None:
-        ref, mid = rate_ref_hz(cfg), 0.5 * (frr[0] + frr[1])
-        if abs(ref - mid) > 0.15 * max(mid, 1e-6):
-            raise ValueError(
-                    f"data.rate_ref_hz={ref} differs too much from the midpoint {mid} of f_rot_range={frr}. "
-                    f"It is the normalization reference for abs_mean and must be approximately equal to the midpoint; "
-                    f"otherwise, the FiLM input scale will be inconsistent.")
-        
-    return NUDFTFreqTransformerAnchor(
-        signal_dim=_signal_dim(cfg), grid_size=grid_size(cfg),
-        f_lo=fcfg["f_min"], f_hi=fcfg["f_max"],
-        d_model=int(t["d_model"]), n_heads=int(t["n_heads"]),
-        n_layers=int(t["n_layers"]), ffn_dim=int(t["ffn_dim"]),
-        dropout=float(t["dropout"]),
-        use_film=bool(cfg["encoder"]["rate_inject"]),
-        summary_dim=film_input_dim(cfg))
-
-
-_FILM_KEY = {"summary": "rate_summary",        # [B,4]      
-             "per_rev": "rev_speeds_norm"}     # [B,n_rev]  
-
-
-def encoder_forward(model, batch, cfg, device):
-    signal = batch["signal"].to(device)
-    t_n = batch["t_n"].to(device)
-    rate = None
-    if cfg["encoder"]["rate_inject"]:
-        rate = batch[_FILM_KEY[film_input(cfg)]].to(device)
-    return model(signal, t_n, rate_summary=rate)
+def load_axial_vit(cfg, grid, grid_step, enc_ckpt, device="cpu", n_time_layers=None):
+    from encoder import build_encoder
+    ftf = build_encoder(cfg).to(device)
+    sd = torch.load(enc_ckpt, map_location=device, weights_only=False)["model_state_dict"]
+    ftf.load_state_dict(sd, strict=True)                 # FTF 本体 strict
+    model = AxialViT(ftf, cfg, n_time_layers=n_time_layers).to(device)
+    return model
