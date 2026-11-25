@@ -37,7 +37,7 @@ report_code/
 ![Training overview](Figures/Encoder_Training.png)
 The second step is to train the neural network. In total, there are four training phases. In Phase 1 and 3, the sigma heads are frozen and the other components of the neural network are trained. In Phase 2 and 4, only the sigma heads are trained. 
 
-The running of the training is implemente in order: 
+The running of the training is implemented in order: 
 
 ### Phase 1
 ```python
